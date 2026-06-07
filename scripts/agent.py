@@ -186,6 +186,10 @@ def call_ai(prompt):
         resp.raise_for_status()
         data = resp.json()
         content = data["content"][0]["text"]
+        if "access denied" in content.lower() or "restricted" in content.lower():
+            log("ОШИБКА: FreeModel Claude endpoint требует официальный Claude Code CLI.")
+            log(f"Тело ответа: {content[:200]}")
+            raise RuntimeError(f"API заблокирован: {content[:200]}")
     else:
         headers = {
             "Authorization": f"Bearer {API_KEY}",
@@ -201,6 +205,9 @@ def call_ai(prompt):
         }
         log(f"Отправка запроса в FreeModel OpenAI-compatible ({MODEL})...")
         resp = requests.post(API_URL, headers=headers, json=payload)
+        if resp.status_code == 402:
+            log("ОШИБКА: Недостаточно средств на аккаунте FreeModel (HTTP 402).")
+            raise RuntimeError("Insufficient FreeModel balance")
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
