@@ -15,8 +15,8 @@ from pathlib import Path
 
 # ==================== НАСТРОЙКИ ====================
 AGENT_MODE = os.environ.get("AGENT_MODE", "auto_todo")
-API_KEY = os.environ["FREEMODEL_API_KEY"]
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+API_KEY = os.environ.get("FREEMODEL_API_KEY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_FULL_NAME = os.environ.get("REPO_FULL_NAME", "")
 MAX_FILES_TO_SCAN = 15
 MAX_FILE_SIZE = 50000
