@@ -1,0 +1,70 @@
+name: AI Agent (FreeModel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим работы агента'
+        required: false
+        default: 'auto_todo'
+        type: choice
+        options:
+          - auto_todo
+          - refactor
+          - bugfix
+          - review
+      api_type:
+        description: 'Тип API'
+        required: false
+        default: 'anthropic'
+        type: choice
+        options:
+          - anthropic  # Claude через cc.freemodel.dev
+          - openai     # GPT через api.freemodel.dev
+      model:
+        description: 'Модель (опционально, по умолчанию подберётся под API)'
+        required: false
+        default: ''
+        type: string
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_run:
+    workflows: ["CI", "Test", "Build"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  ai-agent:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion != 'success' || github.event_name != 'workflow_run' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run AI Agent
+        env:
+          FREEMODEL_API_KEY: ${{ secrets.FREEMODEL_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          AGENT_MODE: ${{ github.event.inputs.mode || 'auto_todo' }}
+          API_TYPE: ${{ github.event.inputs.api_type || 'anthropic' }}
+          MODEL: ${{ github.event.inputs.model || '' }}
+          CI_FAILED: ${{ github.event.workflow_run.conclusion == 'failure' }}
+          RUN_ID: ${{ github.event.workflow_run.id || '' }}
+        run: python scripts/agent.py
