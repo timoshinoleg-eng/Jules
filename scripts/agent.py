@@ -23,7 +23,7 @@ MAX_FILE_SIZE = 50000
 MAX_TOKENS = 4000
 
 # Выбор API: "anthropic" для Claude (cc.freemodel.dev) или "openai" для GPT (api.freemodel.dev)
-API_TYPE = os.environ.get("API_TYPE", "anthropic")
+API_TYPE = os.environ.get("API_TYPE", "openai")
 
 if API_TYPE == "anthropic":
     # Claude через FreeModel
@@ -33,7 +33,7 @@ if API_TYPE == "anthropic":
 else:
     # OpenAI-compatible через FreeModel
     BASE_URL = "https://api.freemodel.dev/v1"
-    MODEL = os.environ.get("MODEL", "gpt-5.5")
+    MODEL = os.environ.get("MODEL", "gpt-5.4")
     API_URL = f"{BASE_URL}/chat/completions"
 
 # ==================== ПРОМПТЫ ====================
