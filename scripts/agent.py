@@ -92,6 +92,9 @@ HEADERS_GH = {
 def log(msg):
     print(f"[AGENT] {msg}")
 
+# TODO: Add retry logic with exponential backoff for API calls
+# TODO: Add support for multiple AI providers (OpenAI, Anthropic, etc.)
+
 
 def get_repo_files():
     """Получаем список файлов в репозитории через GitHub API."""
