@@ -9,9 +9,12 @@ import os
 import re
 import json
 import base64
-import requests
+import time
 from datetime import datetime
-from pathlib import Path
+
+import requests
+from requests import Response
+from requests.exceptions import RequestException
 
 # ==================== НАСТРОЙКИ ====================
 AGENT_MODE = os.environ.get("AGENT_MODE", "auto_todo")
@@ -22,20 +25,14 @@ REPO_FULL_NAME = os.environ.get("REPO_FULL_NAME", "")
 MAX_FILES_TO_SCAN = 15
 MAX_FILE_SIZE = 50000
 MAX_TOKENS = 4000
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 1.5
 
 # Выбор API: "anthropic" для Claude (cc.freemodel.dev) или "openai" для GPT (api.freemodel.dev)
 API_TYPE = os.environ.get("API_TYPE", "openai")
+AI_PROVIDER = os.environ.get("AI_PROVIDER", API_TYPE).strip().lower()
 
-if API_TYPE == "anthropic":
-    # Claude через FreeModel
-    BASE_URL = "https://cc.freemodel.dev"
-    MODEL = os.environ.get("MODEL", "claude-opus-4-20250514")
-    API_URL = f"{BASE_URL}/v1/messages"
-else:
-    # OpenAI-compatible через FreeModel
-    BASE_URL = "https://api.freemodel.dev/v1"
-    MODEL = os.environ.get("MODEL", "gpt-5.4")
-    API_URL = f"{BASE_URL}/chat/completions"
 
 # ==================== ПРОМПТЫ ====================
 SYSTEM_PROMPT = """Ты — senior software engineer и AI-ассистент для автоматизации разработки.
@@ -93,14 +90,103 @@ HEADERS_GH = {
 def log(msg):
     print(f"[AGENT] {msg}")
 
-# TODO: Add retry logic with exponential backoff for API calls
-# TODO: Add support for multiple AI providers (OpenAI, Anthropic, etc.)
+
+def normalize_provider(provider_name):
+    """Нормализуем имя AI-провайдера и поддерживаем алиасы."""
+    aliases = {
+        "claude": "anthropic",
+        "anthropic": "anthropic",
+        "openai": "openai",
+        "gpt": "openai"
+    }
+    normalized = aliases.get(provider_name.strip().lower())
+    if not normalized:
+        raise ValueError(f"Неподдерживаемый AI provider: {provider_name}")
+    return normalized
+
+
+def get_ai_config(provider_name):
+    """Возвращаем конфигурацию для выбранного AI-провайдера."""
+    provider = normalize_provider(provider_name)
+
+    if provider == "anthropic":
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://cc.freemodel.dev")
+        model = os.environ.get("MODEL", "claude-opus-4-20250514")
+        api_url = f"{base_url}/v1/messages"
+    else:
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.freemodel.dev/v1")
+        model = os.environ.get("MODEL", "gpt-5.4")
+        api_url = f"{base_url}/chat/completions"
+
+    return {
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_url": api_url
+    }
+
+
+AI_CONFIG = get_ai_config(AI_PROVIDER)
+API_TYPE = AI_CONFIG["provider"]
+BASE_URL = AI_CONFIG["base_url"]
+MODEL = AI_CONFIG["model"]
+API_URL = AI_CONFIG["api_url"]
+
+
+def should_retry_status(status_code):
+    """Определяем, стоит ли повторять запрос по HTTP-статусу."""
+    retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+    return status_code in retryable_statuses
+
+
+
+def request_with_retry(method, url, headers=None, json_data=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
+    """Выполняем HTTP-запрос с повторными попытками и экспоненциальной задержкой."""
+    last_exception = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_data,
+                timeout=timeout
+            )
+
+            if should_retry_status(response.status_code) and attempt < max_retries:
+                delay = BACKOFF_FACTOR ** (attempt - 1)
+                log(
+                    f"Временная ошибка HTTP {response.status_code} для {method} {url}. "
+                    f"Повтор через {delay:.1f} сек."
+                )
+                time.sleep(delay)
+                continue
+
+            return response
+        except RequestException as exc:
+            last_exception = exc
+            if attempt >= max_retries:
+                break
+
+            delay = BACKOFF_FACTOR ** (attempt - 1)
+            log(
+                f"Сетевая ошибка для {method} {url}: {exc}. "
+                f"Повтор через {delay:.1f} сек."
+            )
+            time.sleep(delay)
+
+    if last_exception:
+        raise RuntimeError(f"Не удалось выполнить запрос {method} {url}: {last_exception}") from last_exception
+
+    raise RuntimeError(f"Не удалось выполнить запрос {method} {url}")
+
 
 
 def get_repo_files():
     """Получаем список файлов в репозитории через GitHub API."""
     url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/trees/HEAD?recursive=1"
-    resp = requests.get(url, headers=HEADERS_GH)
+    resp = request_with_retry("GET", url, headers=HEADERS_GH)
     resp.raise_for_status()
     data = resp.json()
     
@@ -119,10 +205,11 @@ def get_repo_files():
     return files[:MAX_FILES_TO_SCAN]
 
 
+
 def get_file_content(path):
     """Получаем содержимое файла."""
     url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{path}"
-    resp = requests.get(url, headers=HEADERS_GH)
+    resp = request_with_retry("GET", url, headers=HEADERS_GH)
     if resp.status_code != 200:
         return None
     data = resp.json()
@@ -130,24 +217,27 @@ def get_file_content(path):
     return content
 
 
+
 def find_todos_in_files(files):
     """Ищем файлы с TODO/FIXME для приоритета."""
     prioritized = []
-    for f in files:
-        content = get_file_content(f)
+    for file_path in files:
+        content = get_file_content(file_path)
         if content and re.search(r"(TODO|FIXME|XXX|HACK|BUG)", content, re.I):
-            prioritized.append(f)
+            prioritized.append(file_path)
     return prioritized
+
 
 
 def build_context(files):
     """Строим контекст для AI."""
     context = ""
-    for f in files:
-        content = get_file_content(f)
+    for file_path in files:
+        content = get_file_content(file_path)
         if content:
-            context += f"\n--- FILE: {f} ---\n{content}\n"
+            context += f"\n--- FILE: {file_path} ---\n{content}\n"
     return context
+
 
 
 def get_ci_logs():
@@ -157,18 +247,19 @@ def get_ci_logs():
         return ""
     
     jobs_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/actions/runs/{run_id}/jobs"
-    jresp = requests.get(jobs_url, headers=HEADERS_GH)
+    jresp = request_with_retry("GET", jobs_url, headers=HEADERS_GH)
     if jresp.status_code == 200:
         jobs = jresp.json().get("jobs", [])
         logs = []
         for job in jobs:
             if job.get("conclusion") == "failure":
                 steps = job.get("steps", [{}])
-                failed_step = [s for s in steps if s.get("conclusion") == "failure"]
+                failed_step = [step for step in steps if step.get("conclusion") == "failure"]
                 if failed_step:
                     logs.append(f"Job '{job['name']}' failed at step: {failed_step[0].get('name', 'unknown')}")
         return "\n".join(logs) if logs else ""
     return ""
+
 
 
 def call_ai(prompt):
@@ -186,7 +277,7 @@ def call_ai(prompt):
             "messages": [{"role": "user", "content": prompt}]
         }
         log(f"Отправка запроса в Claude через FreeModel ({MODEL})...")
-        resp = requests.post(API_URL, headers=headers, json=payload)
+        resp = request_with_retry("POST", API_URL, headers=headers, json_data=payload)
         resp.raise_for_status()
         data = resp.json()
         content = data["content"][0]["text"]
@@ -208,7 +299,7 @@ def call_ai(prompt):
             ]
         }
         log(f"Отправка запроса в FreeModel OpenAI-compatible ({MODEL})...")
-        resp = requests.post(API_URL, headers=headers, json=payload)
+        resp = request_with_retry("POST", API_URL, headers=headers, json_data=payload)
         if resp.status_code == 402:
             log("ОШИБКА: Недостаточно средств на аккаунте FreeModel (HTTP 402).")
             raise RuntimeError("Insufficient FreeModel balance")
@@ -218,6 +309,7 @@ def call_ai(prompt):
     
     log("Ответ получен")
     return content
+
 
 
 def parse_changes(ai_response):
@@ -238,16 +330,16 @@ def parse_changes(ai_response):
     return data.get("changes", []), data.get("analysis", "")
 
 
+
 def create_branch_and_pr(changes, analysis):
     """Создаём ветку, коммитим изменения и создаём PR."""
     if not changes:
         log("Нет изменений для коммита")
         return
     
-    import time
     for branch in ["main", "master"]:
         url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/ref/heads/{branch}"
-        resp = requests.get(url, headers=HEADERS_GH)
+        resp = request_with_retry("GET", url, headers=HEADERS_GH)
         if resp.status_code == 200:
             base_sha = resp.json()["object"]["sha"]
             base_branch = branch
@@ -257,10 +349,16 @@ def create_branch_and_pr(changes, analysis):
     
     branch_name = f"ai/freemodel-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     create_ref_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/refs"
-    requests.post(create_ref_url, headers=HEADERS_GH, json={
-        "ref": f"refs/heads/{branch_name}",
-        "sha": base_sha
-    }).raise_for_status()
+    create_ref_resp = request_with_retry(
+        "POST",
+        create_ref_url,
+        headers=HEADERS_GH,
+        json_data={
+            "ref": f"refs/heads/{branch_name}",
+            "sha": base_sha
+        }
+    )
+    create_ref_resp.raise_for_status()
     log(f"Создана ветка: {branch_name}")
     time.sleep(2)
     
@@ -271,21 +369,27 @@ def create_branch_and_pr(changes, analysis):
         
         if action == "delete":
             get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
-            gresp = requests.get(get_url, headers=HEADERS_GH)
+            gresp = request_with_retry("GET", get_url, headers=HEADERS_GH)
             if gresp.status_code == 200:
                 sha = gresp.json()["sha"]
                 del_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}"
-                requests.delete(del_url, headers=HEADERS_GH, json={
-                    "message": f"🤖 Удалён {file_path}",
-                    "sha": sha,
-                    "branch": branch_name
-                })
+                delete_resp = request_with_retry(
+                    "DELETE",
+                    del_url,
+                    headers=HEADERS_GH,
+                    json_data={
+                        "message": f"🤖 Удалён {file_path}",
+                        "sha": sha,
+                        "branch": branch_name
+                    }
+                )
+                delete_resp.raise_for_status()
             continue
         
         for attempt in range(3):
             sha = None
             get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
-            gresp = requests.get(get_url, headers=HEADERS_GH)
+            gresp = request_with_retry("GET", get_url, headers=HEADERS_GH)
             if gresp.status_code == 200:
                 sha = gresp.json().get("sha")
             
@@ -298,11 +402,11 @@ def create_branch_and_pr(changes, analysis):
             if sha:
                 payload["sha"] = sha
             
-            put_resp = requests.put(put_url, headers=HEADERS_GH, json=payload)
+            put_resp = request_with_retry("PUT", put_url, headers=HEADERS_GH, json_data=payload)
             if put_resp.status_code in (200, 201):
                 log(f"{'Обновлён' if sha else 'Создан'} файл: {file_path}")
                 break
-            log(f"Попытка {attempt+1} не удалась для {file_path}: HTTP {put_resp.status_code}")
+            log(f"Попытка {attempt + 1} не удалась для {file_path}: HTTP {put_resp.status_code}")
             time.sleep(1)
         else:
             raise Exception(f"Не удалось записать {file_path} после 3 попыток")
@@ -320,15 +424,21 @@ def create_branch_and_pr(changes, analysis):
 ---
 *Создано автоматически через GitHub Actions*"""
     
-    pr_resp = requests.post(pr_url, headers=HEADERS_GH, json={
-        "title": f"🤖 AI: {AGENT_MODE} — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-        "body": pr_body,
-        "head": branch_name,
-        "base": base_branch
-    })
+    pr_resp = request_with_retry(
+        "POST",
+        pr_url,
+        headers=HEADERS_GH,
+        json_data={
+            "title": f"🤖 AI: {AGENT_MODE} — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            "body": pr_body,
+            "head": branch_name,
+            "base": base_branch
+        }
+    )
     pr_resp.raise_for_status()
     pr_data = pr_resp.json()
     log(f"Создан PR: {pr_data['html_url']}")
+
 
 
 def main():
