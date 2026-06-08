@@ -16,7 +16,8 @@ from pathlib import Path
 # ==================== НАСТРОЙКИ ====================
 AGENT_MODE = os.environ.get("AGENT_MODE", "auto_todo")
 API_KEY = os.environ.get("FREEMODEL_API_KEY", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GH_PAT = os.environ.get("GH_PAT", "")  # Personal Access Token with full repo: scope
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "") or GH_PAT  # Fallback to PAT if GITHUB_TOKEN empty
 REPO_FULL_NAME = os.environ.get("REPO_FULL_NAME", "")
 MAX_FILES_TO_SCAN = 15
 MAX_FILE_SIZE = 50000

@@ -61,6 +61,7 @@ jobs:
         env:
           FREEMODEL_API_KEY: ${{ secrets.FREEMODEL_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           REPO_FULL_NAME: ${{ github.repository }}
           AGENT_MODE: ${{ github.event.inputs.mode || 'auto_todo' }}
           API_TYPE: ${{ github.event.inputs.api_type || 'openai' }}
