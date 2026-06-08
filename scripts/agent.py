@@ -8,10 +8,10 @@ FreeModel Auto-Coder Agent
 import os
 import re
 import json
+import time
 import base64
 import requests
 from datetime import datetime
-from pathlib import Path
 
 # ==================== НАСТРОЙКИ ====================
 AGENT_MODE = os.environ.get("AGENT_MODE", "auto_todo")
@@ -22,20 +22,14 @@ REPO_FULL_NAME = os.environ.get("REPO_FULL_NAME", "")
 MAX_FILES_TO_SCAN = 15
 MAX_FILE_SIZE = 50000
 MAX_TOKENS = 4000
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 4
+BACKOFF_FACTOR = 1.5
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 # Выбор API: "anthropic" для Claude (cc.freemodel.dev) или "openai" для GPT (api.freemodel.dev)
-API_TYPE = os.environ.get("API_TYPE", "openai")
+API_TYPE = os.environ.get("API_TYPE", "openai").strip().lower()
 
-if API_TYPE == "anthropic":
-    # Claude через FreeModel
-    BASE_URL = "https://cc.freemodel.dev"
-    MODEL = os.environ.get("MODEL", "claude-opus-4-20250514")
-    API_URL = f"{BASE_URL}/v1/messages"
-else:
-    # OpenAI-compatible через FreeModel
-    BASE_URL = "https://api.freemodel.dev/v1"
-    MODEL = os.environ.get("MODEL", "gpt-5.4")
-    API_URL = f"{BASE_URL}/chat/completions"
 
 # ==================== ПРОМПТЫ ====================
 SYSTEM_PROMPT = """Ты — senior software engineer и AI-ассистент для автоматизации разработки.
@@ -93,14 +87,85 @@ HEADERS_GH = {
 def log(msg):
     print(f"[AGENT] {msg}")
 
-# TODO: Add retry logic with exponential backoff for API calls
-# TODO: Add support for multiple AI providers (OpenAI, Anthropic, etc.)
+
+def get_provider_config(api_type):
+    """Возвращает конфигурацию выбранного AI-провайдера."""
+    providers = {
+        "anthropic": {
+            "name": "Anthropic через FreeModel",
+            "base_url": "https://cc.freemodel.dev",
+            "api_url": "https://cc.freemodel.dev/v1/messages",
+            "default_model": "claude-opus-4-20250514"
+        },
+        "openai": {
+            "name": "OpenAI-compatible через FreeModel",
+            "base_url": "https://api.freemodel.dev/v1",
+            "api_url": "https://api.freemodel.dev/v1/chat/completions",
+            "default_model": "gpt-5.4"
+        }
+    }
+
+    if api_type not in providers:
+        supported = ", ".join(sorted(providers.keys()))
+        raise ValueError(f"Неподдерживаемый API_TYPE: {api_type}. Поддерживаются: {supported}")
+
+    return providers[api_type]
+
+
+PROVIDER_CONFIG = get_provider_config(API_TYPE)
+BASE_URL = PROVIDER_CONFIG["base_url"]
+API_URL = PROVIDER_CONFIG["api_url"]
+MODEL = os.environ.get("MODEL", PROVIDER_CONFIG["default_model"])
+
+
+def request_with_retry(method, url, headers=None, json_data=None, timeout=REQUEST_TIMEOUT, expected_statuses=None):
+    """Выполняет HTTP-запрос с повторными попытками и экспоненциальной задержкой."""
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_data,
+                timeout=timeout
+            )
+
+            if expected_statuses and response.status_code in expected_statuses:
+                return response
+
+            if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                delay = BACKOFF_FACTOR ** (attempt - 1)
+                log(
+                    f"Повтор запроса {method} {url}: HTTP {response.status_code}, "
+                    f"попытка {attempt}/{MAX_RETRIES}, ожидание {delay:.1f} сек"
+                )
+                time.sleep(delay)
+                continue
+
+            return response
+        except requests.RequestException as error:
+            last_error = error
+            if attempt >= MAX_RETRIES:
+                break
+            delay = BACKOFF_FACTOR ** (attempt - 1)
+            log(
+                f"Сетевая ошибка при запросе {method} {url}: {error}. "
+                f"Попытка {attempt}/{MAX_RETRIES}, ожидание {delay:.1f} сек"
+            )
+            time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError(f"Не удалось выполнить запрос {method} {url}")
 
 
 def get_repo_files():
     """Получаем список файлов в репозитории через GitHub API."""
     url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/trees/HEAD?recursive=1"
-    resp = requests.get(url, headers=HEADERS_GH)
+    resp = request_with_retry("GET", url, headers=HEADERS_GH)
     resp.raise_for_status()
     data = resp.json()
     
@@ -122,7 +187,7 @@ def get_repo_files():
 def get_file_content(path):
     """Получаем содержимое файла."""
     url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{path}"
-    resp = requests.get(url, headers=HEADERS_GH)
+    resp = request_with_retry("GET", url, headers=HEADERS_GH)
     if resp.status_code != 200:
         return None
     data = resp.json()
@@ -157,7 +222,7 @@ def get_ci_logs():
         return ""
     
     jobs_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/actions/runs/{run_id}/jobs"
-    jresp = requests.get(jobs_url, headers=HEADERS_GH)
+    jresp = request_with_retry("GET", jobs_url, headers=HEADERS_GH)
     if jresp.status_code == 200:
         jobs = jresp.json().get("jobs", [])
         logs = []
@@ -172,7 +237,7 @@ def get_ci_logs():
 
 
 def call_ai(prompt):
-    """Отправляем запрос в AI API (Anthropic или OpenAI-compatible)."""
+    """Отправляем запрос в AI API через выбранного провайдера."""
     if API_TYPE == "anthropic":
         headers = {
             "x-api-key": API_KEY,
@@ -185,8 +250,8 @@ def call_ai(prompt):
             "system": SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": prompt}]
         }
-        log(f"Отправка запроса в Claude через FreeModel ({MODEL})...")
-        resp = requests.post(API_URL, headers=headers, json=payload)
+        log(f"Отправка запроса в {PROVIDER_CONFIG['name']} ({MODEL})...")
+        resp = request_with_retry("POST", API_URL, headers=headers, json_data=payload)
         resp.raise_for_status()
         data = resp.json()
         content = data["content"][0]["text"]
@@ -194,7 +259,9 @@ def call_ai(prompt):
             log("ОШИБКА: FreeModel Claude endpoint требует официальный Claude Code CLI.")
             log(f"Тело ответа: {content[:200]}")
             raise RuntimeError(f"API заблокирован: {content[:200]}")
-    else:
+        return content
+
+    if API_TYPE == "openai":
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json"
@@ -207,17 +274,16 @@ def call_ai(prompt):
                 {"role": "user", "content": prompt}
             ]
         }
-        log(f"Отправка запроса в FreeModel OpenAI-compatible ({MODEL})...")
-        resp = requests.post(API_URL, headers=headers, json=payload)
+        log(f"Отправка запроса в {PROVIDER_CONFIG['name']} ({MODEL})...")
+        resp = request_with_retry("POST", API_URL, headers=headers, json_data=payload)
         if resp.status_code == 402:
             log("ОШИБКА: Недостаточно средств на аккаунте FreeModel (HTTP 402).")
             raise RuntimeError("Insufficient FreeModel balance")
         resp.raise_for_status()
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-    
-    log("Ответ получен")
-    return content
+        return data["choices"][0]["message"]["content"]
+
+    raise ValueError(f"Неподдерживаемый тип API: {API_TYPE}")
 
 
 def parse_changes(ai_response):
@@ -244,10 +310,9 @@ def create_branch_and_pr(changes, analysis):
         log("Нет изменений для коммита")
         return
     
-    import time
     for branch in ["main", "master"]:
         url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/ref/heads/{branch}"
-        resp = requests.get(url, headers=HEADERS_GH)
+        resp = request_with_retry("GET", url, headers=HEADERS_GH)
         if resp.status_code == 200:
             base_sha = resp.json()["object"]["sha"]
             base_branch = branch
@@ -257,10 +322,16 @@ def create_branch_and_pr(changes, analysis):
     
     branch_name = f"ai/freemodel-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     create_ref_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/refs"
-    requests.post(create_ref_url, headers=HEADERS_GH, json={
-        "ref": f"refs/heads/{branch_name}",
-        "sha": base_sha
-    }).raise_for_status()
+    create_branch_response = request_with_retry(
+        "POST",
+        create_ref_url,
+        headers=HEADERS_GH,
+        json_data={
+            "ref": f"refs/heads/{branch_name}",
+            "sha": base_sha
+        }
+    )
+    create_branch_response.raise_for_status()
     log(f"Создана ветка: {branch_name}")
     time.sleep(2)
     
@@ -271,41 +342,42 @@ def create_branch_and_pr(changes, analysis):
         
         if action == "delete":
             get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
-            gresp = requests.get(get_url, headers=HEADERS_GH)
+            gresp = request_with_retry("GET", get_url, headers=HEADERS_GH)
             if gresp.status_code == 200:
                 sha = gresp.json()["sha"]
                 del_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}"
-                requests.delete(del_url, headers=HEADERS_GH, json={
-                    "message": f"🤖 Удалён {file_path}",
-                    "sha": sha,
-                    "branch": branch_name
-                })
+                delete_response = request_with_retry(
+                    "DELETE",
+                    del_url,
+                    headers=HEADERS_GH,
+                    json_data={
+                        "message": f"🤖 Удалён {file_path}",
+                        "sha": sha,
+                        "branch": branch_name
+                    }
+                )
+                delete_response.raise_for_status()
             continue
         
-        for attempt in range(3):
-            sha = None
-            get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
-            gresp = requests.get(get_url, headers=HEADERS_GH)
-            if gresp.status_code == 200:
-                sha = gresp.json().get("sha")
-            
-            put_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}"
-            payload = {
-                "message": f"🤖 {action}: {file_path}",
-                "content": base64.b64encode(content.encode()).decode(),
-                "branch": branch_name
-            }
-            if sha:
-                payload["sha"] = sha
-            
-            put_resp = requests.put(put_url, headers=HEADERS_GH, json=payload)
-            if put_resp.status_code in (200, 201):
-                log(f"{'Обновлён' if sha else 'Создан'} файл: {file_path}")
-                break
-            log(f"Попытка {attempt+1} не удалась для {file_path}: HTTP {put_resp.status_code}")
-            time.sleep(1)
-        else:
-            raise Exception(f"Не удалось записать {file_path} после 3 попыток")
+        sha = None
+        get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
+        gresp = request_with_retry("GET", get_url, headers=HEADERS_GH)
+        if gresp.status_code == 200:
+            sha = gresp.json().get("sha")
+        
+        put_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}"
+        payload = {
+            "message": f"🤖 {action}: {file_path}",
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": branch_name
+        }
+        if sha:
+            payload["sha"] = sha
+        
+        put_resp = request_with_retry("PUT", put_url, headers=HEADERS_GH, json_data=payload)
+        if put_resp.status_code not in (200, 201):
+            raise Exception(f"Не удалось записать {file_path}: HTTP {put_resp.status_code}")
+        log(f"{'Обновлён' if sha else 'Создан'} файл: {file_path}")
     
     pr_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/pulls"
     pr_body = f"""## 🤖 Автоматический PR от AI Agent
@@ -320,12 +392,17 @@ def create_branch_and_pr(changes, analysis):
 ---
 *Создано автоматически через GitHub Actions*"""
     
-    pr_resp = requests.post(pr_url, headers=HEADERS_GH, json={
-        "title": f"🤖 AI: {AGENT_MODE} — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-        "body": pr_body,
-        "head": branch_name,
-        "base": base_branch
-    })
+    pr_resp = request_with_retry(
+        "POST",
+        pr_url,
+        headers=HEADERS_GH,
+        json_data={
+            "title": f"🤖 AI: {AGENT_MODE} — {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            "body": pr_body,
+            "head": branch_name,
+            "base": base_branch
+        }
+    )
     pr_resp.raise_for_status()
     pr_data = pr_resp.json()
     log(f"Создан PR: {pr_data['html_url']}")
