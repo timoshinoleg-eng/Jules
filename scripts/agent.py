@@ -243,7 +243,7 @@ def create_branch_and_pr(changes, analysis):
         log("Нет изменений для коммита")
         return
     
-    # Получаем SHA последнего коммита
+    import time
     for branch in ["main", "master"]:
         url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/git/ref/heads/{branch}"
         resp = requests.get(url, headers=HEADERS_GH)
@@ -261,6 +261,7 @@ def create_branch_and_pr(changes, analysis):
         "sha": base_sha
     }).raise_for_status()
     log(f"Создана ветка: {branch_name}")
+    time.sleep(2)
     
     for change in changes:
         file_path = change["file_path"]
@@ -280,23 +281,30 @@ def create_branch_and_pr(changes, analysis):
                 })
             continue
         
-        sha = None
-        get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
-        gresp = requests.get(get_url, headers=HEADERS_GH)
-        if gresp.status_code == 200:
-            sha = gresp.json().get("sha")
-        
-        put_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}"
-        payload = {
-            "message": f"🤖 {action}: {file_path}",
-            "content": base64.b64encode(content.encode()).decode(),
-            "branch": branch_name
-        }
-        if sha:
-            payload["sha"] = sha
-        
-        requests.put(put_url, headers=HEADERS_GH, json=payload).raise_for_status()
-        log(f"{'Обновлён' if sha else 'Создан'} файл: {file_path}")
+        for attempt in range(3):
+            sha = None
+            get_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}?ref={branch_name}"
+            gresp = requests.get(get_url, headers=HEADERS_GH)
+            if gresp.status_code == 200:
+                sha = gresp.json().get("sha")
+            
+            put_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/contents/{file_path}"
+            payload = {
+                "message": f"🤖 {action}: {file_path}",
+                "content": base64.b64encode(content.encode()).decode(),
+                "branch": branch_name
+            }
+            if sha:
+                payload["sha"] = sha
+            
+            put_resp = requests.put(put_url, headers=HEADERS_GH, json=payload)
+            if put_resp.status_code in (200, 201):
+                log(f"{'Обновлён' if sha else 'Создан'} файл: {file_path}")
+                break
+            log(f"Попытка {attempt+1} не удалась для {file_path}: HTTP {put_resp.status_code}")
+            time.sleep(1)
+        else:
+            raise Exception(f"Не удалось записать {file_path} после 3 попыток")
     
     pr_url = f"{GITHUB_API}/repos/{REPO_FULL_NAME}/pulls"
     pr_body = f"""## 🤖 Автоматический PR от AI Agent
